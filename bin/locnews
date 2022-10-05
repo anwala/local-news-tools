@@ -1,0 +1,307 @@
+#!python
+import argparse
+import json
+import logging
+import sys
+
+from os import makedirs
+
+from locnews.util import dumpJsonToFile
+from locnews.util import genericErrorInfo
+from locnews.util import getDictFromJsonGZ
+from locnews.util import getNowFilename
+from locnews.util import getStopwordsDict
+from locnews.util import gzipTextFile
+from locnews.util import setLogDefaults
+from locnews.util import setLoggerDets
+
+from NwalaTextUtils.textutils import getDedupKeyForURI
+from NwalaTextUtils.textutils import parallelGetTxtFrmURIs
+from NwalaTextUtils.textutils import updateLogger
+
+from locnews.NewsTitlesProcesses import cluster_local_news_titles
+from locnews.NewsTitlesProcesses import gen_non_specific_beats
+from locnews.NewsTitlesProcesses import local_news_beats_explorer
+
+from locnews.LMP import get_us_local_media_for_state_or_region
+from locnews.LMP import get_non_us_media_for_country
+from locnews.NewsTitles import NewsTitles
+
+logger = logging.getLogger('us_pulse.us_pulse')
+
+def get_generic_args():
+
+    regions = 'new_england, mid_atlantic, eastern_central, southeast, midwest, heartland, southwest, rocky_mountain, pacific_coast, non_contiguous, usa (all regions)'
+    parser = argparse.ArgumentParser(formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=30), description='Clusters local news titles')
+    parser.add_argument('locations', nargs='+', help=f'The US state abbreviation (e.g., IN, VA) OR region OR city (country ≠ "USA") to query for local news media. US Regions: {regions}')
+    
+    parser.add_argument('-b', '--border', choices=['city', 'state', 'domain'], help='Category by which to cluster local media.')
+    parser.add_argument('-c', '--country', default='usa', help='Country for extracting local media.')
+    parser.add_argument('-d', '--description', default='', help='Graph description.')
+
+    parser.add_argument('-e', '--exclude', default='tv radio', help='Space-separated list of media types (newspaper and/or tv and/or radio) to exclude.')
+    parser.add_argument('-f', '--file', action='store_true', help='Process file that contains local media and titles instead of starting from scratch.')
+
+    parser.add_argument('-l', '--max-links', type=int, default=100, help='The maximum number of links to extract per local media.')
+    parser.add_argument('--log-file', default='', help='Log output filename')
+    parser.add_argument('--log-format', default='', help='Log print format, see: https://docs.python.org/3/howto/logging-cookbook.html')
+    parser.add_argument('--log-level', default='info', choices=['critical', 'error', 'warning', 'info', 'debug', 'notset'], help='Log level')
+    parser.add_argument('-m', '--media-count', type=int, default=100, help='The number of location media to extract per location.')
+    parser.add_argument('-n', '--name', default='', help='Graph name.')
+    parser.add_argument('--no-border', action='store_true', help='Cluster across location border.')
+
+    parser.add_argument('-o', '--output', help='Output path (for titles clusterer) or output filename (for news-beats)')
+    parser.add_argument('--output-filename', default='', help='Override auto-generated filename with --output-filename')
+    parser.add_argument('--pretty-print', help='Pretty print JSON output', action='store_true')
+    
+    #news-beats task
+    parser.add_argument('--beats-cache-path', default='', help='Cache path for beats storage/lookup')
+    parser.add_argument('--beats-resolver', default='', choices=['tf'], help='Method to use to resolve non-specific beats (e.g., "news") to specific beats (e.g., "health")')
+    parser.add_argument('-bs', '--add-beats-stopword', nargs='+', help='User-defined additional stopwords.')
+    parser.add_argument('--cursor-loc', default='back', choices=['back', 'front'], help='The position to start extracting beat words. E.g., given beat hierarchy news/sports/football, front start from news, back starts from football.')
+    parser.add_argument('--max-beat-len', type=int, default=10, help='Maximum number of characters per news beat.')
+    parser.add_argument('--news-beats', action='store_true', help='Explore the local news beats')
+    parser.add_argument('--order-beats-by', default='joined_beats', choices=['joined_beats', 'domain'], help='The sort order for beats.')
+    parser.add_argument('--top-k-beats', type=int, default=3, help='For each media, this specifies the number of top beats to return.')
+    parser.add_argument('--word-count', type=int, default=1, help='The number of beat words.')
+
+    #title clusterer task
+    parser.add_argument('--cluster-titles', action='store_true', help='Cluster news titles.')
+
+    #generate non-specific beat terms
+    parser.add_argument('--general-beats', action='store_true', help='Generate non-specific beat terms (e.g., "news", "story"), user decides final list and stores result in Resources/non_specific_beats/')
+    return parser
+
+def add_news_stopwords(stopwords):
+    news_stopwords = [
+        'live'
+    ]
+
+    for w in news_stopwords:
+        stopwords[w] = True
+
+def get_local_media_titles(loc_media, max_links, border='city'):
+
+    if( len(loc_media) == 0 ):
+        return []
+
+    #updateLogger('us_pulse.us_pulse')
+
+    loc_news_titles = {'group_name': border, 'media_groups': {}}
+    uri_lst = [ m['website'] for m in loc_media ]
+    doc_lst = parallelGetTxtFrmURIs( uri_lst, cleanHTML=False, addResponseHeader=True )
+
+    '''
+        w = 'http://www.carycitizen.com/'
+        addResponseHeader = True#True
+        doc_lst = parallelGetTxtFrmURIs( [w], cleanHTML=False, addResponseHeader=addResponseHeader )
+        w = doc_lst[0]['info']['response_history'][-1]['url']
+
+        loc_n = NewsTitles(w, {}, max_links=10)
+        loc_titles = loc_n.extract_links( html=doc_lst[0]['text'], deref_uri=False )
+        print( loc_titles )
+    '''
+    skip_media = 0
+    total_links = 0
+    media_count = len(loc_media)
+
+    stopwords = getStopwordsDict()
+    add_news_stopwords(stopwords)
+    
+    media_dedup_set = set()
+
+    for i in range( media_count ):
+        
+        if( 'response_history' not in doc_lst[i]['info'] ):
+            skip_media += 1
+            continue
+        
+        #some urls might have changed due to redirects, so update with last uri
+        url = doc_lst[i]['info']['response_history'][-1]['url'] 
+
+        med_ky = getDedupKeyForURI(url)
+        if( med_ky in media_dedup_set ):
+            continue
+        media_dedup_set.add(med_ky)
+
+        loc_n = NewsTitles( url, loc_media[i]['details'], max_links=max_links )
+        loc_titles = loc_n.extract_links( stopwords, html=doc_lst[i]['text'], deref_uri=False )
+        
+        if( len(loc_titles) == 0 ):
+            continue
+
+        total_links += len(loc_titles)
+        
+        if( border == '' ):
+            loc_news_titles['media_groups'].setdefault( 'all', {'links': []} )
+            loc_news_titles['media_groups']['all']['links'] += loc_titles
+        else:
+            border_name = loc_titles[0]['details'][border]
+            loc_news_titles['media_groups'].setdefault( border_name, {'links': []} )
+            loc_news_titles['media_groups'][border_name]['links'] += loc_titles
+    
+    logger.info( f'\nextracted total of ' + '{:,} links'.format(total_links) + f' skipped {skip_media} of {media_count} media' )
+
+    return loc_news_titles
+
+def get_local_media_dets(loc_media):
+
+    if( 'locations' not in loc_media ):
+        return []
+
+    local_media = []
+    media_dedup_set = set()
+    
+    for loc in loc_media['locations']:
+        
+        #loc keys: ['city', 'city-latitude', 'city-longitude', 'collection', 'country', 'self', 'state', 'timestamp']    
+        if( 'city' not in loc or 'state' not in loc or 'collection' not in loc ):
+            continue
+
+        for med in loc['collection']:
+            
+            med_ky = getDedupKeyForURI( med['website'] )
+            if( med_ky in media_dedup_set ):
+                continue
+            media_dedup_set.add(med_ky)
+
+            #med keys: ['city-county-lat', 'city-county-long', 'city-county-name', 'country', 'facebook', 'media-class', 'media-subclass', 'miles', 'name', 'open-search', 'rss', 'state', 'twitter', 'video', 'website']
+            dets = { 
+                'city': med['city-county-name'], 
+                'city_county_lat': med['city-county-lat'], 
+                'city_county_long': med['city-county-long'],
+                'state': loc['state'], 
+                'media_type': med['media-class'],
+                'name': med['name'],
+                'twitter': med['twitter']
+            }
+
+            local_media.append({
+                'details': dets,
+                'website': med['website']
+            })
+
+    return local_media
+
+
+def write_media_grp_clusters( media_grp_clusts, args ):
+
+    if( 'media_group_clusters' not in media_grp_clusts ):
+        return
+
+    try:
+        makedirs(args.output, exist_ok=True)
+    except:
+        genericErrorInfo()
+        return
+
+    path = args.output.strip()
+    if( path == '' ):
+        path = './'
+    path = path + '/' if path[-1] != '/' else path
+    slug = f'{args.max_links}_{args.media_count}'
+
+    for med_grp in media_grp_clusts['media_group_clusters']:
+    
+        now_f = getNowFilename()
+        grp_name = med_grp['group_name']
+
+        f = f'{path}{grp_name}_{now_f}_{slug}.json' if args.output_filename == '' else f'{path}{args.output_filename}'
+        
+        graph_description = args.description if args.description != '' else 'Cluster of local {:,} news articles from {:,} sources'.format(args.max_links, args.media_count)
+        graph_name = args.name if args.name != '' else f'US Pulse for {grp_name}'
+        med_grp['graph']['custom'] = { 'description': graph_description, 'name': graph_name, 'self': ' '.join(sys.argv) }
+    
+        dumpJsonToFile(f, med_grp['graph'], indentFlag=args.pretty_print, extraParams={'verbose': False} )
+        logger.info('wrote output: ' + f)
+
+def write_output( media_payload, args ):
+
+    if( 'media_group_clusters' in media_payload ):
+        write_media_grp_clusters( media_payload, args )
+        return
+    
+    gzipTextFile(args.output, json.dumps(media_payload, ensure_ascii=False))
+    #dumpJsonToFile( args.output, media_payload, indentFlag=args.pretty_print, extraParams={'verbose': False} )
+    logger.info('wrote output: ' + args.output)
+
+def proc_req(args):
+    
+    params = vars(args)
+
+    setLogDefaults( params )
+    setLoggerDets( logger, params['log_dets'] )
+    
+    local_media = {}
+    total_links = args.max_links * args.media_count * len(args.locations)
+    logger.info('\nuspulse:')
+    logger.info(f'\t{args.max_links} max_links per {args.media_count} media × {str(args.locations)}: ' + '{:,}'.format(total_links) + ' maximum links')
+
+    if( args.file is False ):
+        if( args.country.lower() == 'usa' ):
+            border = 'state'
+            local_media = get_us_local_media_for_state_or_region(args.locations, src_count=args.media_count, off_option=args.exclude, **params)
+        else:
+            border = 'city'
+            country = params.pop('country')
+            local_media = get_non_us_media_for_country(country, args.locations, src_count=args.media_count, off_option=args.exclude, **params)
+
+    #if user overrides border
+    if( args.border is not None ):
+        border = args.border
+
+    #enforce border for news-beats
+    if( args.news_beats is True ):
+        border = 'domain'
+
+    if( 'locations' not in local_media and args.file is False ):
+        logger.error('"locations" not in local_media, returning')
+        return
+    
+
+    border = '' if args.no_border is True else border
+    logger.info('\tborder: ' + border)
+
+    if( args.file is True ):
+        payload = {} if len(args.locations) == 0 else getDictFromJsonGZ( args.locations[0] )
+    else: 
+        local_media = get_local_media_dets(local_media)
+        payload = get_local_media_titles( local_media, args.max_links, border=border )
+
+
+    if( len(payload) == 0 ):
+        logger.error('titles payload empty, returning')
+        return
+
+    if( args.news_beats is True ):
+        payload = local_news_beats_explorer( payload, **params )
+
+    elif( args.general_beats is True ):
+        payload = gen_non_specific_beats( payload )
+    
+    elif( args.cluster_titles is True ):
+        payload = cluster_local_news_titles( payload )
+
+
+    if( args.output is not None ):
+        write_output( payload, args )
+
+def main():
+
+    if( len(sys.argv) > 1 ):
+        if( sys.argv[1] == '-v' or sys.argv[1] == '--version' ):
+
+            from locnews.config import __appversion__
+            print(__appversion__)
+            return
+
+    parser = get_generic_args()
+    args = parser.parse_args()
+
+    args.add_beats_stopword = set(args.add_beats_stopword)
+    proc_req(args)
+
+if __name__ == "__main__":
+    
+    main()
+    

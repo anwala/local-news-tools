@@ -1,0 +1,6 @@
+.DS_Store
+*.pyc
+
+__pycache__
+/experiment/
+/Resources/Local_News_Graphs
